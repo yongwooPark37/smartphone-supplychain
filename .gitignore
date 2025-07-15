@@ -1,0 +1,23 @@
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Virtual environments
+.venv/
+env/
+venv/
+
+# VSCode settings
+.vscode/
+
+# SQLite DB 백업이나 잠금파일
+*.db
+*.sqlite
+*.sqlite3
+*.db-journal
+
+
+# macOS 또는 Windows 특화
+.DS_Store
+Thumbs.db
