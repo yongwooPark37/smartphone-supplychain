@@ -14,6 +14,19 @@ def main():
     print("=== Missing Values ===")
     print(cc.isna().sum(), "\n")
 
+    if 'CAN' not in cc['country'].unique():
+        ref_countries = ['USA', 'GBR', 'DEU']
+        ref_avg = (
+            cc[cc['country'].isin(ref_countries)]
+            .groupby('month')['confidence_index']
+            .mean()
+            .reset_index()
+        )
+        ref_avg['country'] = 'CAN'
+        cc = pd.concat([cc, ref_avg], ignore_index=True)
+        print("✅ 캐나다(CAN) 소비자지수 생성 완료 (다른 국가 평균 기반)\n")
+
+    
     # 2) Z-Score 기반 이상치 검출
     # country 그룹별 평균과 표준편차 계산
     cc["mean_cc"] = cc.groupby("country")["confidence_index"].transform("mean")
