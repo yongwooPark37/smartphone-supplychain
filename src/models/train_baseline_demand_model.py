@@ -1,46 +1,45 @@
 # src/models/train_baseline_demand_model.py
 
+from typing import Dict, List, Tuple
 import sqlite3
 import pandas as pd
 import numpy as np
-from pathlib import Path
-# from sklearn.ensemble import HistGradientBoostingRegressor
 from sklearn.preprocessing import LabelEncoder, StandardScaler
-from sklearn.metrics import mean_squared_error
+from sklearn.metrics import mean_squared_error, r2_score
 import matplotlib.pyplot as plt
 from xgboost import XGBRegressor
 
+# 경로 견고화
 import sys
 from pathlib import Path
 SCRIPT = Path(__file__).resolve()
 PROJECT_ROOT = SCRIPT.parents[2]
 SRC_DIR = PROJECT_ROOT / "src"
-sys.path.append(str(SRC_DIR))
-from data.feature_engineering import add_event_and_promo_flags
-from data.feature_engineering import add_time_series_features
-
-# === 경로 견고화 ===
-SCRIPT = Path(__file__).resolve()
-PROJECT_ROOT = SCRIPT.parents[2]
 DATA_DIR = PROJECT_ROOT / "data"
-# ======================
+sys.path.append(str(SRC_DIR))
+
+from data.feature_engineering import add_time_series_features
+from data.process_demand import detect_launch_events
 
 def load_features() -> pd.DataFrame:
-    """모든 원본 테이블 로드 + 병합 + 기본 전처리"""
-    # 1) 기본 데이터 로드
+    # 1) 공통 피처 로드
     oil   = pd.read_csv(DATA_DIR/"oil_price_processed.csv", parse_dates=["date"])
-    curr  = pd.read_csv(DATA_DIR/"currency_processed.csv", parse_dates=["date"])
+    curr  = pd.read_csv(DATA_DIR/"currency_processed.csv",    parse_dates=["date"])
     cc    = pd.read_csv(DATA_DIR/"consumer_confidence_processed.csv", parse_dates=["date"])
-    sku   = pd.read_csv(DATA_DIR/"sku_meta.csv", parse_dates=["launch_date"])
-    promo = pd.read_csv(DATA_DIR/"price_promo_train.csv", parse_dates=["date"])
-    ms    = pd.read_csv(DATA_DIR/"marketing_spend.csv", parse_dates=["date"])
-    cal   = pd.read_csv(DATA_DIR/"calendar.csv", parse_dates=["date"])
+    sku   = pd.read_csv(DATA_DIR/"sku_meta.csv",              parse_dates=["launch_date"])
+    promo = pd.read_csv(DATA_DIR/"price_promo_train.csv",     parse_dates=["date"])
+    ms    = pd.read_csv(DATA_DIR/"marketing_spend.csv",       parse_dates=["date"])
+    cal   = pd.read_csv(DATA_DIR/"calendar.csv",              parse_dates=["date"])
 
-    conn = sqlite3.connect(DATA_DIR/"demand_train.db")
-    dem  = pd.read_sql("SELECT date, city, sku, demand FROM demand_train", conn, parse_dates=["date"])
+    # 2) demand_train_processed 로드
+    db_path = DATA_DIR/"demand_train_processed.db"
+    conn = sqlite3.connect(db_path)
+    dem  = pd.read_sql(
+        "SELECT date, city, sku, demand FROM demand_train",
+        conn, parse_dates=["date"]
+    )
     conn.close()
 
-    # 2) city→country 매핑
     country_map = {
         'Washington_DC':'USA','New_York':'USA','Chicago':'USA','Dallas':'USA',
         'Berlin':'DEU','Munich':'DEU','Frankfurt':'DEU','Hamburg':'DEU',
@@ -53,13 +52,21 @@ def load_features() -> pd.DataFrame:
         'Brasilia':'BRA','Sao_Paulo':'BRA','Rio_de_Janeiro':'BRA','Salvador':'BRA',
         'Pretoria':'ZAF','Johannesburg':'ZAF','Cape_Town':'ZAF','Durban':'ZAF'
     }
+    events = detect_launch_events(
+        dem,
+        sku_meta_path=DATA_DIR/"sku_meta.csv",
+        country_map=country_map,
+        threshold=1.5,
+        window=15
+    )
+
+    # 3) city→country 매핑
     dem["country"] = dem["city"].map(country_map)
 
-    # 3) 기본 병합
+    # 4) 기본 병합
     df = dem.copy()
-    # 3-1) oil
     df = df.merge(oil[["date","brent_usd","oil_spike"]], on="date", how="left")
-    # 3-2) currency (multi-currency → long)
+
     curr_long = (
         curr.melt(id_vars="date", var_name="raw_currency", value_name="rate")
             .assign(currency=lambda d: d["raw_currency"].str.replace("=X$", "", regex=True))
@@ -73,40 +80,42 @@ def load_features() -> pd.DataFrame:
         curr_long[["date","currency","rate"]],
         on=["date","currency"], how="left"
     ).rename(columns={"rate":"fx_rate"})
-    df.loc[df["currency"]=="USD","fx_rate"] = 1.0
+    df.loc[df["currency"]=="USD", "fx_rate"] = 1.0
 
-    # 3-3) consumer confidence
     df = df.merge(cc[["date","country","confidence_index"]], on=["date","country"], how="left")
-    # 3-4) sku_meta
     df = df.merge(sku[["sku","family","storage_gb","life_days","launch_date"]], on="sku", how="left")
-    # 3-5) price_promo (unit_price)
-    df = df.merge(promo[["date","sku","city","unit_price"]], on=["date","sku","city"], how="left")
-    # 3-6) marketing spend
-    df = df.merge(ms[["date","country","spend_usd"]], on=["date","country"], how="left")
-    # 3-7) season
-    df = df.merge(
-        cal[["date","country","season"]],
-        on=["date","country"],
-        how="left"
-    )
+    df = df.merge(promo[["date","sku","city","unit_price"]],         on=["date","sku","city"], how="left")
+    df = df.merge(ms[["date","country","spend_usd"]],               on=["date","country"],   how="left")
+    df = df.merge(cal[["date","country","season"]],                 on=["date","country"],   how="left")
 
-    # 4) 결측 보간
+    # 5) 결측 보간
     df["unit_price"] = df["unit_price"].ffill()
     df["spend_usd"] = df["spend_usd"].fillna(0)
     df["fx_rate"] = df["fx_rate"].ffill()
 
-    # 5) 이벤트·프로모션 플래그
-    df = add_event_and_promo_flags(df, DATA_DIR, window=15)
-    # 6) 시계열 랙·롤링 피처
+    # 6) 할인 프로모션 플래그
+    promo = pd.read_csv(DATA_DIR/"price_promo_train.csv", parse_dates=["date"])
+    promo["promo_flag"] = (promo["discount_pct"] > 0).astype(int)
+    df = df.merge(promo[["date","sku","city","promo_flag"]], on=["date","sku","city"], how="left")
+    df["promo_flag"] = df["promo_flag"].fillna(0)
+
+    # 7) 시계열 랙·롤링 피처
     df = add_time_series_features(df, lags=[1,7,14], rolls=[7,14])
 
-    # 7) days_since_launch
+    # 8) days_since_launch
     df["days_since_launch"] = (df["date"] - df["launch_date"]).dt.days.clip(lower=0)
+
+    # 9) 신제품 공개 행사
+    df["launch_event"] = 0
+    for country, periods in events.items():
+        for start, end in periods:
+            mask = (df["country"]==country) & (df["date"]>=start) & (df["date"]<=end)
+            df.loc[mask, "launch_event"] = 1
 
     return df
 
 def train_baseline_with_xgb(df: pd.DataFrame):
-    """2018–2021 학습, 2022 검증 → RMSE 출력 (XGBoost 버전)"""
+    """2018–2021 학습, 2022 검증 → RMSE/R2 출력 (XGBoost 버전)"""
     mask = (df["date"] >= "2018-01-01") & (df["date"] <= "2022-12-31")
     data = df.loc[mask].dropna().copy()
 
@@ -116,13 +125,12 @@ def train_baseline_with_xgb(df: pd.DataFrame):
 
     # 수치형 스케일링
     num_cols = [
-    "brent_usd","unit_price","spend_usd","confidence_index",
-    "demand_lag_1","demand_lag_7","demand_lag_14",
-    "demand_roll_7","demand_roll_14",
-    "days_since_launch"
+        "brent_usd","unit_price","spend_usd","confidence_index",
+        "demand_lag_1","demand_lag_7","demand_lag_14",
+        "demand_roll_7","demand_roll_14",
+        "days_since_launch"
     ]
-    scaler = StandardScaler()
-    X[num_cols] = scaler.fit_transform(X[num_cols])
+    X[num_cols] = StandardScaler().fit_transform(X[num_cols])
 
     # 범주형 인코딩
     for col in ["city","country","sku","family","season","promo_flag","launch_event"]:
@@ -134,6 +142,7 @@ def train_baseline_with_xgb(df: pd.DataFrame):
     X_train, y_train = X.loc[train_idx], y.loc[train_idx]
     X_val,   y_val   = X.loc[~train_idx], y.loc[~train_idx]
 
+    # XGBoost 모델에 eval_metric 을 생성자에 넘기기
     model = XGBRegressor(
         n_estimators=200,
         learning_rate=0.1,
@@ -141,15 +150,18 @@ def train_baseline_with_xgb(df: pd.DataFrame):
         subsample=0.8,
         colsample_bytree=0.8,
         random_state=42,
-        tree_method="hist"         
+        tree_method="hist"
     )
-
     model.fit(X_train, y_train)
 
+    # 예측 & 지표 계산
     preds = model.predict(X_val)
     rmse = np.sqrt(mean_squared_error(y_val, preds))
+    r2   = r2_score(y_val, preds)
     print(f"XGBoost Validation RMSE: {rmse:.2f}")
+    print(f"XGBoost Validation R²:   {r2:.3f}")
 
+    # 검증용 데이터에 예측값 붙여서 리턴
     val = data.loc[~train_idx].copy()
     val["pred"] = preds
     return model, val
