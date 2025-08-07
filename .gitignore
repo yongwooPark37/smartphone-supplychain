@@ -21,3 +21,6 @@ venv/
 # macOS 또는 Windows 특화
 .DS_Store
 Thumbs.db
+
+# csv
+*.csv

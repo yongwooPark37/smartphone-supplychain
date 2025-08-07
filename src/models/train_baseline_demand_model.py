@@ -19,7 +19,7 @@ DATA_DIR = PROJECT_ROOT / "data"
 sys.path.append(str(SRC_DIR))
 
 from data.feature_engineering import add_time_series_features
-from data.process_demand import detect_launch_events
+from data.process_demand import detect_soft_event_score
 
 def load_features() -> pd.DataFrame:
     # 1) 공통 피처 로드
@@ -52,13 +52,6 @@ def load_features() -> pd.DataFrame:
         'Brasilia':'BRA','Sao_Paulo':'BRA','Rio_de_Janeiro':'BRA','Salvador':'BRA',
         'Pretoria':'ZAF','Johannesburg':'ZAF','Cape_Town':'ZAF','Durban':'ZAF'
     }
-    events = detect_launch_events(
-        dem,
-        sku_meta_path=DATA_DIR/"sku_meta.csv",
-        country_map=country_map,
-        threshold=1.5,
-        window=15
-    )
 
     # 3) city→country 매핑
     dem["country"] = dem["city"].map(country_map)
@@ -83,7 +76,7 @@ def load_features() -> pd.DataFrame:
     df.loc[df["currency"]=="USD", "fx_rate"] = 1.0
 
     df = df.merge(cc[["date","country","confidence_index"]], on=["date","country"], how="left")
-    df = df.merge(sku[["sku","family","storage_gb","life_days","launch_date"]], on="sku", how="left")
+    df = df.merge(sku[["sku","family","storage_gb", "launch_date"]], on="sku", how="left")
     df = df.merge(promo[["date","sku","city","unit_price"]],         on=["date","sku","city"], how="left")
     df = df.merge(ms[["date","country","spend_usd"]],               on=["date","country"],   how="left")
     df = df.merge(cal[["date","country","season"]],                 on=["date","country"],   how="left")
@@ -106,11 +99,15 @@ def load_features() -> pd.DataFrame:
     df["days_since_launch"] = (df["date"] - df["launch_date"]).dt.days.clip(lower=0)
 
     # 9) 신제품 공개 행사
-    df["launch_event"] = 0
-    for country, periods in events.items():
-        for start, end in periods:
-            mask = (df["country"]==country) & (df["date"]>=start) & (df["date"]<=end)
-            df.loc[mask, "launch_event"] = 1
+    soft_df = detect_soft_event_score(
+        df=dem,
+        sku_meta_path=DATA_DIR/"sku_meta.csv",
+        country_map=country_map,
+        threshold_pct=0.20,
+        min_days=10,
+        max_days=90
+    )
+    df = df.merge(soft_df, on=["date","country"], how="left")
 
     return df
 
@@ -121,20 +118,24 @@ def train_baseline_with_xgb(df: pd.DataFrame):
 
     # 피처/타겟 분리
     X = data.drop(columns=["demand","date","launch_date","currency"])
+    X = X.drop(columns=["demand_roll_14"])
+    X = X.drop(columns=["confidence_index"])
+    print(X.head(5))
     y = data["demand"]
 
     # 수치형 스케일링
     num_cols = [
-        "brent_usd","unit_price","spend_usd","confidence_index",
+        "brent_usd","unit_price",
         "demand_lag_1","demand_lag_7","demand_lag_14",
-        "demand_roll_7","demand_roll_14",
-        "days_since_launch"
+        "demand_roll_7"
     ]
     X[num_cols] = StandardScaler().fit_transform(X[num_cols])
 
     # 범주형 인코딩
-    for col in ["city","country","sku","family","season","promo_flag","launch_event"]:
+    for col in ["city","country","sku","family","season","promo_flag"]:
         X[col] = LabelEncoder().fit_transform(X[col].astype(str))
+    
+    print(X.head(5))
 
     # 학습/검증 분할
     split = "2022-01-01"
