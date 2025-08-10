@@ -1,11 +1,15 @@
 # src/models/final_forecast_model.py
+# EDA 기반 고급 시계열 예측 모델 - 출제자 접근법 반영
 
 import pandas as pd
 import numpy as np
 import sqlite3
 from pathlib import Path
-from sklearn.ensemble import RandomForestRegressor
-from sklearn.preprocessing import LabelEncoder
+from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
+from sklearn.linear_model import LinearRegression
+from sklearn.preprocessing import LabelEncoder, StandardScaler
+from sklearn.metrics import mean_squared_error, r2_score
+from sklearn.decomposition import PCA
 import matplotlib.pyplot as plt
 import warnings
 warnings.filterwarnings('ignore')
@@ -30,25 +34,69 @@ def get_country_mapping():
         'Pretoria':'ZAF','Johannesburg':'ZAF','Cape_Town':'ZAF','Durban':'ZAF'
     }
 
-def get_event_multipliers():
-    """실제 과거 데이터 분석 결과를 바탕으로 한 배수"""
-    return {
-        '2023': {
-            'CAN': ('2023-09-01', '2023-11-30', 2.57),
-            'DEU': ('2023-11-01', '2023-12-31', 2.30),
-            'BRA': ('2023-10-01', '2023-12-31', 2.34),
-        },
-        '2024': {
-            'DEU': ('2024-07-01', '2024-09-30', 2.30),
-            'JPN': ('2024-07-01', '2024-09-30', 2.21),
-            'GBR': ('2024-07-01', '2024-09-30', 2.39),
-        }
-    }
+def create_global_confidence_factor(consumer_conf):
+    """글로벌 신뢰지수 요인 생성 (출제자 방식)"""
+    # 피벗 테이블 생성
+    wide = consumer_conf.pivot(index="month", columns="country", values="confidence_index").sort_index()
+    
+    # 결측치 처리
+    wide = wide.fillna(method='ffill')
+    
+    # 표준화
+    scaler = StandardScaler()
+    Z = scaler.fit_transform(wide)
+    
+    # PCA로 글로벌 요인 추출
+    pca = PCA(n_components=2)
+    global_factors = pca.fit_transform(Z)
+    
+    # 글로벌 요인을 시계열로 변환
+    global_factor_df = pd.DataFrame({
+        'year_month': wide.index,
+        'global_factor_1': global_factors[:, 0],
+        'global_factor_2': global_factors[:, 1]
+    })
+    
+    return global_factor_df, pca, scaler
 
-def load_training_data():
-    """학습 데이터 로드 (계절 정보 포함)"""
-    # 수요 데이터
-    conn = sqlite3.connect(DATA_DIR / "demand_train_processed.db")
+def detect_events_using_zscore(demand, threshold=2.0):
+    """Z-score 기반 이벤트 탐지 (출제자 방식)"""
+    # 국가별 월별 수요 집계
+    demand['year_month'] = demand['date'].dt.to_period('M')
+    monthly_country_demand = demand.groupby(['country', 'year_month'])['demand'].sum().reset_index()
+    
+    events_detected = []
+    
+    for country in monthly_country_demand['country'].unique():
+        country_data = monthly_country_demand[monthly_country_demand['country'] == country].copy()
+        country_data = country_data.sort_values('year_month')
+        
+        # 이동 평균과 표준편차 계산
+        country_data['demand_mean'] = country_data['demand'].rolling(window=12, min_periods=1).mean()
+        country_data['demand_std'] = country_data['demand'].rolling(window=12, min_periods=1).std()
+        country_data['z_score'] = (country_data['demand'] - country_data['demand_mean']) / country_data['demand_std']
+        
+        # 이벤트 감지
+        events = country_data[country_data['z_score'] > threshold]
+        
+        for _, event in events.iterrows():
+            events_detected.append({
+                'country': country,
+                'date': event['year_month'],
+                'demand': event['demand'],
+                'z_score': event['z_score'],
+                'normal_demand': event['demand_mean'],
+                'multiplier': event['demand'] / event['demand_mean']
+            })
+    
+    return pd.DataFrame(events_detected)
+
+def load_enhanced_training_data():
+    """EDA 기반 고급 학습 데이터 로드"""
+    print("=== EDA 기반 고급 데이터 로드 ===")
+    
+    # 1. 수요 데이터
+    conn = sqlite3.connect(DATA_DIR / "demand_train.db")
     demand = pd.read_sql("SELECT * FROM demand_train", conn, parse_dates=['date'])
     conn.close()
     
@@ -56,129 +104,263 @@ def load_training_data():
     country_map = get_country_mapping()
     demand["country"] = demand["city"].map(country_map)
     
-    # 기본 피처들
+    # 2. 외부 데이터 로드
+    oil = pd.read_csv(DATA_DIR / "oil_price.csv", parse_dates=["date"])
+    currency = pd.read_csv(DATA_DIR / "currency.csv", parse_dates=["Date"])
+    currency = currency.rename(columns={"Date": "date"})
+    consumer_conf = pd.read_csv(DATA_DIR / "consumer_confidence.csv", parse_dates=["month"])
+    marketing = pd.read_csv(DATA_DIR / "marketing_spend.csv", parse_dates=["date"])
+    weather = pd.read_csv(DATA_DIR / "weather.csv", parse_dates=["date"])
+    calendar = pd.read_csv(DATA_DIR / "calendar.csv", parse_dates=["date"])
+    sku_meta = pd.read_csv(DATA_DIR / "sku_meta.csv", parse_dates=["launch_date"])
+    ppt = pd.read_csv(DATA_DIR / "price_promo_train.csv", parse_dates=["date"])
+    
+    # 3. 기본 시간 피처
     demand["year"] = demand["date"].dt.year
     demand["month"] = demand["date"].dt.month
     demand["dayofyear"] = demand["date"].dt.dayofyear
     demand["weekday"] = demand["date"].dt.weekday
     demand["quarter"] = demand["date"].dt.quarter
     
-    # 계절 정보 추가 (calendar.csv에서)
-    calendar = pd.read_csv(DATA_DIR / "calendar.csv", parse_dates=["date"])
+    # 4. 계절성 피처 (EDA에서 발견: 9월 최고점, 1월 최저점)
+    demand['month_sin'] = np.sin(2 * np.pi * demand['month'] / 12)
+    demand['month_cos'] = np.cos(2 * np.pi * demand['month'] / 12)
+    demand['dayofyear_sin'] = np.sin(2 * np.pi * demand['dayofyear'] / 365)
+    demand['dayofyear_cos'] = np.cos(2 * np.pi * demand['dayofyear'] / 365)
+    
+    # 5. 계절 정보 추가
     demand = demand.merge(calendar[["date", "country", "season"]], on=["date", "country"], how="left")
     
-    # SKU 메타 정보
-    sku_meta = pd.read_csv(DATA_DIR / "sku_meta.csv", parse_dates=["launch_date"])
+    # 6. SKU 메타 정보
     demand = demand.merge(sku_meta[["sku", "family", "storage_gb", "launch_date"]], on="sku", how="left")
     demand["days_since_launch"] = (demand["date"] - demand["launch_date"]).dt.days.clip(lower=0)
     
-    # 시계열 피처 - 더 다양한 랙과 롤링 윈도우
+    # 7. 시계열 피처 (EDA 기반 최적화)
     demand = demand.sort_values(["city", "sku", "date"])
     
-    # 다양한 랙 피처
+    # 다양한 랙 피처 (EDA에서 중요도 확인)
     for lag in [1, 3, 7, 14, 30]:
         demand[f"demand_lag_{lag}"] = demand.groupby(["city", "sku"])["demand"].shift(lag).fillna(0)
     
-    # 롤링 평균 피처 - 간단한 방법으로 변경
+    # 롤링 통계
     for window in [7, 14, 30]:
-        demand[f"demand_rolling_mean_{window}"] = demand.groupby(["city", "sku"])["demand"].transform(lambda x: x.rolling(window=window, min_periods=1).mean())
-        demand[f"demand_rolling_std_{window}"] = demand.groupby(["city", "sku"])["demand"].transform(lambda x: x.rolling(window=window, min_periods=1).std())
+        demand[f"demand_rolling_mean_{window}"] = demand.groupby(["city", "sku"])["demand"].transform(
+            lambda x: x.rolling(window=window, min_periods=1).mean()
+        )
+        demand[f"demand_rolling_std_{window}"] = demand.groupby(["city", "sku"])["demand"].transform(
+            lambda x: x.rolling(window=window, min_periods=1).std()
+        )
     
-    # 도시별, SKU별 평균 수요 (기준값)
-    city_sku_avg = demand.groupby(["city", "sku"])["demand"].mean().reset_index()
-    city_sku_avg = city_sku_avg.rename(columns={"demand": "city_sku_avg_demand"})
-    demand = demand.merge(city_sku_avg, on=["city", "sku"], how="left")
+    # 8. 외부 요인 추가
+    # 유가 데이터
+    oil['pct_change'] = oil['brent_usd'].pct_change()
+    oil['volatility_7d'] = oil['pct_change'].rolling(7).std()
+    demand = demand.merge(oil[['date', 'brent_usd', 'pct_change', 'volatility_7d']], on='date', how='left')
     
-    # 국가별 평균 수요
-    country_avg = demand.groupby(["country", "sku"])["demand"].mean().reset_index()
-    country_avg = country_avg.rename(columns={"demand": "country_sku_avg_demand"})
-    demand = demand.merge(country_avg, on=["country", "sku"], how="left")
+    # 환율 데이터 (주요 환율만)
+    fx_cols = ['EUR=X', 'KRW=X', 'JPY=X', 'GBP=X', 'CAD=X', 'AUD=X', 'BRL=X', 'ZAR=X']
+    demand = demand.merge(currency[['date'] + fx_cols], on='date', how='left')
     
-    # 월별 평균 수요
-    month_avg = demand.groupby(["month", "sku"])["demand"].mean().reset_index()
-    month_avg = month_avg.rename(columns={"demand": "month_sku_avg_demand"})
-    demand = demand.merge(month_avg, on=["month", "sku"], how="left")
+    # 소비자신뢰지수
+    consumer_conf['year_month'] = consumer_conf['month'].dt.to_period('M')
+    demand['year_month'] = demand['date'].dt.to_period('M')
+    demand = demand.merge(consumer_conf[['year_month', 'country', 'confidence_index']], 
+                         on=['year_month', 'country'], how='left')
     
-    return demand
+    # 마케팅 지출
+    demand = demand.merge(marketing[['date', 'country', 'spend_usd']], on=['date', 'country'], how='left')
+    
+    # 날씨 데이터
+    demand = demand.merge(weather[['date', 'country', 'avg_temp', 'humidity']], on=['date', 'country'], how='left')
+    
+    # 결측치 처리
+    demand = demand.fillna(0)
+    
+    # 9. 글로벌 신뢰지수 요인 생성 (출제자 방식)
+    global_factor_df, pca, scaler = create_global_confidence_factor(consumer_conf)
+    demand = demand.merge(global_factor_df, on='year_month', how='left')
+    
+    # 10. 가격 정보 추가
+    demand = demand.merge(ppt[['date', 'sku', 'city', 'unit_price', 'discount_pct']], 
+                         on=['date', 'sku', 'city'], how='left')
+    
+    # 11. 집계 피처 (EDA 기반)
+    # 도시별 평균
+    city_avg = demand.groupby('city')['demand'].mean().reset_index()
+    city_avg = city_avg.rename(columns={'demand': 'city_avg_demand'})
+    demand = demand.merge(city_avg, on='city', how='left')
+    
+    # SKU별 평균
+    sku_avg = demand.groupby('sku')['demand'].mean().reset_index()
+    sku_avg = sku_avg.rename(columns={'demand': 'sku_avg_demand'})
+    demand = demand.merge(sku_avg, on='sku', how='left')
+    
+    # 국가별 평균
+    country_avg = demand.groupby('country')['demand'].mean().reset_index()
+    country_avg = country_avg.rename(columns={'demand': 'country_avg_demand'})
+    demand = demand.merge(country_avg, on='country', how='left')
+    
+    # 12. 변동성 피처
+    demand['demand_volatility'] = demand.groupby(['city', 'sku'])['demand'].transform(
+        lambda x: x.rolling(window=30, min_periods=1).std()
+    )
+    
+    # 13. 이벤트 탐지 및 피처 추가
+    events_df = detect_events_using_zscore(demand, threshold=2.0)
+    
+    # 이벤트 플래그 추가
+    demand['is_event_month'] = 0
+    demand['event_multiplier'] = 1.0
+    if len(events_df) > 0:
+        for _, event in events_df.iterrows():
+            mask = (demand['country'] == event['country']) & (demand['year_month'] == event['date'])
+            demand.loc[mask, 'is_event_month'] = 1
+            demand.loc[mask, 'event_multiplier'] = event['multiplier']
+    
+    print(f"데이터 로드 완료: {demand.shape}")
+    print(f"이벤트 감지: {len(events_df)}개")
+    
+    return demand, events_df, pca, scaler
 
-def train_final_model(train_data):
-    """최종 모델 학습"""
-    train_mask = train_data["year"] <= 2021
-    val_mask = train_data["year"] == 2022
+def train_enhanced_ensemble_model(train_data):
+    """EDA 기반 고급 앙상블 모델 학습"""
+    print("=== EDA 기반 고급 앙상블 모델 학습 ===")
+    
+    # 학습/검증 분할
+    train_mask = train_data['year'] <= 2021
+    val_mask = train_data['year'] == 2022
     
     train_set = train_data[train_mask].copy()
     val_set = train_data[val_mask].copy()
     
-    # 피처 선택 (season 사용, month 제거)
+    # 피처 선택 (EDA 기반 최적화)
     feature_cols = [
-        "city", "sku", "country", "family", 
-        "season", "month", "quarter", "dayofyear", "weekday", "storage_gb",
-        "days_since_launch", 
-        "demand_lag_1", "demand_lag_3", "demand_lag_7", "demand_lag_14", "demand_lag_30",
-        "demand_rolling_mean_7", "demand_rolling_mean_14", "demand_rolling_mean_30",
-        "demand_rolling_std_7", "demand_rolling_std_14", "demand_rolling_std_30",
-        "city_sku_avg_demand", "country_sku_avg_demand", "month_sku_avg_demand"
+        # 시간 피처
+        'month', 'weekday', 'quarter', 'dayofyear',
+        'month_sin', 'month_cos', 'dayofyear_sin', 'dayofyear_cos',
+        
+        # SKU 피처
+        'days_since_launch', 'storage_gb',
+        
+        # 시계열 피처
+        'demand_lag_1', 'demand_lag_3', 'demand_lag_7', 'demand_lag_14', 'demand_lag_30',
+        'demand_rolling_mean_7', 'demand_rolling_mean_14', 'demand_rolling_mean_30',
+        'demand_rolling_std_7', 'demand_rolling_std_14', 'demand_rolling_std_30',
+        
+        # 외부 요인
+        'brent_usd', 'pct_change', 'volatility_7d',
+        'confidence_index', 'spend_usd', 'avg_temp', 'humidity',
+        'global_factor_1', 'global_factor_2',
+        
+        # 가격 정보
+        'unit_price', 'discount_pct',
+        
+        # 집계 피처
+        'city_avg_demand', 'sku_avg_demand', 'country_avg_demand',
+        
+        # 이벤트 피처
+        'is_event_month', 'event_multiplier',
+        
+        # 변동성
+        'demand_volatility'
     ]
+    
+    # 환율 피처 추가
+    fx_cols = ['EUR=X', 'KRW=X', 'JPY=X', 'GBP=X', 'CAD=X', 'AUD=X', 'BRL=X', 'ZAR=X']
+    feature_cols.extend(fx_cols)
     
     # 범주형 인코딩
     label_encoders = {}
-    for col in ["city", "sku", "country", "family", "season"]:
+    categorical_cols = ['city', 'sku', 'country', 'family', 'season']
+    
+    for col in categorical_cols:
         le = LabelEncoder()
-        train_set[col + "_encoded"] = le.fit_transform(train_set[col].astype(str))
-        val_set[col + "_encoded"] = le.transform(val_set[col].astype(str))
+        train_set[col + '_encoded'] = le.fit_transform(train_set[col].astype(str))
+        val_set[col + '_encoded'] = le.transform(val_set[col].astype(str))
         label_encoders[col] = le
-        feature_cols.append(col + "_encoded")
-        feature_cols.remove(col)
+        feature_cols.append(col + '_encoded')
     
-    # 모델 학습 - 과소평가 문제 해결을 위한 파라미터 조정
+    # 결측치 처리
+    for col in feature_cols:
+        if col in train_set.columns:
+            train_set[col] = train_set[col].fillna(0)
+            val_set[col] = val_set[col].fillna(0)
+    
+    # 수치형 스케일링
+    scaler = StandardScaler()
+    numeric_features = [col for col in feature_cols if col not in [col + '_encoded' for col in categorical_cols]]
+    
     X_train = train_set[feature_cols]
-    y_train = train_set["demand"]
-    
-    model = RandomForestRegressor(
-        n_estimators=200,  # 트리 수 증가
-        max_depth=20,      # 깊이 증가
-        min_samples_split=5,  # 분할 기준 완화
-        min_samples_leaf=2,   # 리프 노드 최소 샘플 완화
-        random_state=42,
-        n_jobs=-1
-    )
-    model.fit(X_train, y_train)
-    
-    # 검증
+    X_train[numeric_features] = scaler.fit_transform(X_train[numeric_features])
     X_val = val_set[feature_cols]
-    y_val = val_set["demand"]
-    val_pred = model.predict(X_val)
+    X_val[numeric_features] = scaler.transform(X_val[numeric_features])
     
-    from sklearn.metrics import mean_squared_error, r2_score
-    rmse = np.sqrt(mean_squared_error(y_val, val_pred))
-    r2 = r2_score(y_val, val_pred)
+    y_train = train_set['demand']
+    y_val = val_set['demand']
     
-    print(f"Final Model - Validation RMSE: {rmse:.2f}")
-    print(f"Final Model - Validation R²: {r2:.3f}")
+    # 3가지 모델 학습 (EDA 기반 최적화)
+    models = {
+        'random_forest': RandomForestRegressor(
+            n_estimators=200, max_depth=15, min_samples_split=10, 
+            min_samples_leaf=5, random_state=42, n_jobs=-1
+        ),
+        'gradient_boosting': GradientBoostingRegressor(
+            n_estimators=150, max_depth=8, learning_rate=0.1, 
+            subsample=0.8, random_state=42
+        ),
+        'linear_regression': LinearRegression()
+    }
     
-    # 과소평가 문제 진단
-    print(f"\n=== Bias Analysis ===")
-    print(f"Actual mean: {y_val.mean():.2f}")
-    print(f"Predicted mean: {val_pred.mean():.2f}")
-    print(f"Bias: {val_pred.mean() - y_val.mean():.2f}")
-    print(f"Relative bias: {((val_pred.mean() - y_val.mean()) / y_val.mean() * 100):.1f}%")
+    trained_models = {}
+    predictions = {}
     
-    # 피처 중요도
-    importance_df = pd.DataFrame({
-        "feature": X_train.columns,
-        "importance": model.feature_importances_
-    }).sort_values("importance", ascending=False)
+    for name, model in models.items():
+        print(f"학습 중: {name}")
+        model.fit(X_train, y_train)
+        trained_models[name] = model
+        
+        # 검증 예측
+        pred = model.predict(X_val)
+        predictions[name] = pred
+        
+        # 개별 모델 성능
+        rmse = np.sqrt(mean_squared_error(y_val, pred))
+        r2 = r2_score(y_val, pred)
+        print(f"  {name} - RMSE: {rmse:.2f}, R²: {r2:.3f}")
     
-    print("\n=== Top 10 Feature Importance ===")
-    print(importance_df.head(10))
+    # 동적 가중치 계산 (성능 기반)
+    weights = {}
+    total_score = 0
+    for name, pred in predictions.items():
+        rmse = np.sqrt(mean_squared_error(y_val, pred))
+        score = 1 / (1 + rmse)  # RMSE가 낮을수록 높은 점수
+        weights[name] = score
+        total_score += score
+    
+    # 가중치 정규화
+    for name in weights:
+        weights[name] /= total_score
+    
+    print(f"\n동적 가중치: {weights}")
+    
+    # 앙상블 예측
+    ensemble_pred = np.zeros(len(y_val))
+    for name, pred in predictions.items():
+        ensemble_pred += weights[name] * pred
+    
+    # 앙상블 성능
+    ensemble_rmse = np.sqrt(mean_squared_error(y_val, ensemble_pred))
+    ensemble_r2 = r2_score(y_val, ensemble_pred)
+    print(f"\n앙상블 - RMSE: {ensemble_rmse:.2f}, R²: {ensemble_r2:.3f}")
     
     # 2022 검증 결과 시각화
-    visualize_2022_validation(val_set, val_pred, r2)
+    visualize_2022_validation(val_set, ensemble_pred, ensemble_r2)
     
-    return model, label_encoders, feature_cols
+    return trained_models, label_encoders, scaler, feature_cols, weights
 
 def visualize_2022_validation(val_set, val_pred, r2_score):
     """2022 검증 결과 시각화"""
+    print("=== 2022 검증 결과 시각화 ===")
     
     # val_pred를 val_set과 같은 순서로 정렬
     val_set_with_pred = val_set.copy()
@@ -192,181 +374,235 @@ def visualize_2022_validation(val_set, val_pred, r2_score):
     comparison = daily_actual.merge(daily_pred, on="date", suffixes=("", "_pred"))
     comparison = comparison.rename(columns={"predicted": "predicted"})
     
-    # 시각화 - 하나의 그래프만
-    plt.figure(figsize=(12, 6))
+    # 시각화
+    plt.figure(figsize=(15, 8))
     plt.plot(comparison["date"], comparison["demand"], label="Actual", alpha=0.8, linewidth=2, color='blue')
     plt.plot(comparison["date"], comparison["predicted"], label="Predicted", alpha=0.8, linewidth=2, color='red')
     plt.title(f"2022 Daily Demand: Actual vs Predicted (R² = {r2_score:.3f})")
     plt.xlabel("Date")
-    plt.ylabel("Total Daily Demand")
+    plt.ylabel("Daily Total Demand")
     plt.legend()
     plt.grid(True, alpha=0.3)
-    plt.xticks(rotation=45)
     plt.tight_layout()
     plt.show()
     
-    # 추가 통계 출력
-    print(f"\n=== 2022 Validation Statistics ===")
-    print(f"Total days: {len(comparison)}")
-    print(f"Average actual demand: {comparison['demand'].mean():.1f}")
-    print(f"Average predicted demand: {comparison['predicted'].mean():.1f}")
-    errors = comparison["predicted"] - comparison["demand"]
-    print(f"Mean absolute error: {np.abs(errors).mean():.1f}")
-    print(f"Root mean squared error: {np.sqrt((errors**2).mean()):.1f}")
+    # 성능 분석
+    print(f"실제 평균: {comparison['demand'].mean():.1f}")
+    print(f"예측 평균: {comparison['predicted'].mean():.1f}")
+    print(f"편향: {comparison['predicted'].mean() - comparison['demand'].mean():.1f}")
 
-def generate_final_forecast():
-    """최종 예측 생성"""
+def generate_enhanced_forecast():
+    """EDA 기반 고급 예측 생성"""
+    print("=== EDA 기반 고급 예측 생성 ===")
     
-    print("Loading training data...")
-    train_data = load_training_data()
+    # 1. 고급 데이터 로드
+    train_data, events_df, pca, scaler = load_enhanced_training_data()
     
-    print("Training final model...")
-    final_model, label_encoders, feature_cols = train_final_model(train_data)
+    # 2. 고급 모델 학습
+    trained_models, label_encoders, scaler, feature_cols, weights = train_enhanced_ensemble_model(train_data)
     
-    print("Loading forecast template...")
-    template = pd.read_csv(DATA_DIR / "forecast_submission_template.csv", parse_dates=["date"])
+    # 3. 미래 데이터 생성
+    future_dates = pd.date_range(start="2023-01-01", end="2024-12-31", freq="D")
+    future_df = pd.DataFrame({"date": future_dates})
     
     # 기본 피처 추가
-    country_map = get_country_mapping()
-    template["country"] = template["city"].map(country_map)
-    template["year"] = template["date"].dt.year
-    template["month"] = template["date"].dt.month
-    template["quarter"] = template["date"].dt.quarter
-    template["dayofyear"] = template["date"].dt.dayofyear
-    template["weekday"] = template["date"].dt.weekday
+    future_df["year"] = future_df["date"].dt.year
+    future_df["month"] = future_df["date"].dt.month
+    future_df["dayofyear"] = future_df["date"].dt.dayofyear
+    future_df["weekday"] = future_df["date"].dt.weekday
+    future_df["quarter"] = future_df["date"].dt.quarter
     
-    # 계절 정보 추가
+    # 계절성 피처
+    future_df["month_sin"] = np.sin(2 * np.pi * future_df["month"] / 12)
+    future_df["month_cos"] = np.cos(2 * np.pi * future_df["month"] / 12)
+    future_df["dayofyear_sin"] = np.sin(2 * np.pi * future_df["dayofyear"] / 365)
+    future_df["dayofyear_cos"] = np.cos(2 * np.pi * future_df["dayofyear"] / 365)
+    
+    # 외부 데이터 로드
+    oil = pd.read_csv(DATA_DIR / "oil_price.csv", parse_dates=["date"])
+    currency = pd.read_csv(DATA_DIR / "currency.csv", parse_dates=["Date"])
+    currency = currency.rename(columns={"Date": "date"})
+    consumer_conf = pd.read_csv(DATA_DIR / "consumer_confidence.csv", parse_dates=["month"])
+    marketing = pd.read_csv(DATA_DIR / "marketing_spend.csv", parse_dates=["date"])
+    weather = pd.read_csv(DATA_DIR / "weather.csv", parse_dates=["date"])
     calendar = pd.read_csv(DATA_DIR / "calendar.csv", parse_dates=["date"])
-    template = template.merge(calendar[["date", "country", "season"]], on=["date", "country"], how="left")
-    
-    # SKU 메타 정보
     sku_meta = pd.read_csv(DATA_DIR / "sku_meta.csv", parse_dates=["launch_date"])
-    template = template.merge(sku_meta[["sku", "family", "storage_gb", "launch_date"]], on="sku", how="left")
-    template["days_since_launch"] = (template["date"] - template["launch_date"]).dt.days.clip(lower=0)
+    ppt = pd.read_csv(DATA_DIR / "price_promo_train.csv", parse_dates=["date"])
     
-    # 평균값 피처들 (2022년 데이터 기반)
-    recent_data = train_data[train_data["year"] == 2022]
+    # 미래 데이터에 외부 요인 추가
+    oil['pct_change'] = oil['brent_usd'].pct_change()
+    oil['volatility_7d'] = oil['pct_change'].rolling(7).std()
+    future_df = future_df.merge(oil[['date', 'brent_usd', 'pct_change', 'volatility_7d']], on='date', how='left')
     
-    # 도시별, SKU별 평균
-    city_sku_avg = recent_data.groupby(["city", "sku"])["demand"].mean().reset_index()
-    city_sku_avg = city_sku_avg.rename(columns={"demand": "city_sku_avg_demand"})
-    template = template.merge(city_sku_avg, on=["city", "sku"], how="left")
+    fx_cols = ['EUR=X', 'KRW=X', 'JPY=X', 'GBP=X', 'CAD=X', 'AUD=X', 'BRL=X', 'ZAR=X']
+    future_df = future_df.merge(currency[['date'] + fx_cols], on='date', how='left')
     
-    # 국가별, SKU별 평균
-    country_sku_avg = recent_data.groupby(["country", "sku"])["demand"].mean().reset_index()
-    country_sku_avg = country_sku_avg.rename(columns={"demand": "country_sku_avg_demand"})
-    template = template.merge(country_sku_avg, on=["country", "sku"], how="left")
+    future_df = future_df.merge(calendar[["date", "country", "season"]], on="date", how="left")
+    future_df = future_df.merge(marketing[['date', 'country', 'spend_usd']], on=['date', 'country'], how='left')
+    future_df = future_df.merge(weather[['date', 'country', 'avg_temp', 'humidity']], on=['date', 'country'], how='left')
     
-    # 월별, SKU별 평균
-    month_sku_avg = recent_data.groupby(["month", "sku"])["demand"].mean().reset_index()
-    month_sku_avg = month_sku_avg.rename(columns={"demand": "month_sku_avg_demand"})
-    template = template.merge(month_sku_avg, on=["month", "sku"], how="left")
+    # 글로벌 요인 추가
+    consumer_conf['year_month'] = consumer_conf['month'].dt.to_period('M')
+    future_df['year_month'] = future_df['date'].dt.to_period('M')
+    future_df = future_df.merge(consumer_conf[['year_month', 'country', 'confidence_index']], 
+                               on=['year_month', 'country'], how='left')
     
-    # 랙 피처들 (최근 평균값으로 대체)
-    recent_avg = recent_data.groupby(["city", "sku"])["demand"].mean()
-    template = template.set_index(["city", "sku"]).join(recent_avg.rename("recent_avg")).reset_index()
-    template["recent_avg"] = template["recent_avg"].fillna(train_data["demand"].mean())
+    # 글로벌 요인 생성
+    global_factor_df, _, _ = create_global_confidence_factor(consumer_conf)
+    future_df = future_df.merge(global_factor_df, on='year_month', how='left')
     
-    # 다양한 랙 피처들
-    for lag in [1, 3, 7, 14, 30]:
-        template[f"demand_lag_{lag}"] = template["recent_avg"] * (0.9 + 0.1 * np.random.random(len(template)))
+    # 결측치 처리
+    future_df = future_df.fillna(0)
     
-    # 롤링 평균 피처들
-    for window in [7, 14, 30]:
-        template[f"demand_rolling_mean_{window}"] = template["recent_avg"] * (0.95 + 0.05 * np.random.random(len(template)))
-        template[f"demand_rolling_std_{window}"] = template["recent_avg"] * 0.1
+    results = []
     
-    # 누락값 처리
-    for col in ["city_sku_avg_demand", "country_sku_avg_demand", "month_sku_avg_demand"]:
-        template[col] = template[col].fillna(template["recent_avg"])
+    # 각 도시-SKU 조합에 대해 예측
+    cities = train_data["city"].unique()
+    skus = train_data["sku"].unique()
     
-    # 범주형 인코딩
-    for col, le in label_encoders.items():
-        try:
-            template[col + "_encoded"] = le.transform(template[col].astype(str))
-        except ValueError:
-            template[col + "_encoded"] = 0
+    for city in cities:
+        country = get_country_mapping()[city]
+        
+        for sku in skus:
+            sku_info = sku_meta[sku_meta["sku"] == sku].iloc[0]
+            
+            # 해당 SKU의 과거 데이터
+            sku_history = train_data[(train_data["city"] == city) & (train_data["sku"] == sku)].sort_values("date")
+            
+            if len(sku_history) == 0:
+                continue
+            
+            # 시계열 데이터 초기화
+            demand_series = sku_history["demand"].tolist()
+            
+            # 집계 값들 계산
+            city_avg = sku_history["demand"].mean() if len(sku_history) > 0 else 0
+            sku_avg = train_data[train_data["sku"] == sku]["demand"].mean()
+            country_avg = train_data[train_data["country"] == country]["demand"].mean()
+            
+            # 각 미래 날짜에 대해 단계별 예측
+            for date in future_dates:
+                # 피처 생성
+                date_features = future_df[future_df["date"] == date].copy()
+                date_features["city"] = city
+                date_features["country"] = country
+                date_features["sku"] = sku
+                date_features["family"] = sku_info["family"]
+                date_features["storage_gb"] = sku_info["storage_gb"]
+                date_features["launch_date"] = sku_info["launch_date"]
+                date_features["days_since_launch"] = (date - date_features["launch_date"]).dt.days.clip(lower=0)
+                
+                # 시계열 피처 계산
+                if len(demand_series) >= 30:
+                    lag_1 = demand_series[-1]
+                    lag_3 = demand_series[-3]
+                    lag_7 = demand_series[-7]
+                    lag_14 = demand_series[-14]
+                    lag_30 = demand_series[-30]
+                    rolling_mean_7 = np.mean(demand_series[-7:])
+                    rolling_mean_14 = np.mean(demand_series[-14:])
+                    rolling_mean_30 = np.mean(demand_series[-30:])
+                    rolling_std_7 = np.std(demand_series[-7:])
+                    rolling_std_14 = np.std(demand_series[-14:])
+                    rolling_std_30 = np.std(demand_series[-30:])
+                    volatility = np.std(demand_series[-30:])
+                else:
+                    recent_demand = demand_series[-1] if demand_series else 0
+                    lag_1 = lag_3 = lag_7 = lag_14 = lag_30 = recent_demand
+                    rolling_mean_7 = rolling_mean_14 = rolling_mean_30 = recent_demand
+                    rolling_std_7 = rolling_std_14 = rolling_std_30 = 0
+                    volatility = 0
+                
+                # 피처 설정
+                date_features["demand_lag_1"] = lag_1
+                date_features["demand_lag_3"] = lag_3
+                date_features["demand_lag_7"] = lag_7
+                date_features["demand_lag_14"] = lag_14
+                date_features["demand_lag_30"] = lag_30
+                date_features["demand_rolling_mean_7"] = rolling_mean_7
+                date_features["demand_rolling_mean_14"] = rolling_mean_14
+                date_features["demand_rolling_mean_30"] = rolling_mean_30
+                date_features["demand_rolling_std_7"] = rolling_std_7
+                date_features["demand_rolling_std_14"] = rolling_std_14
+                date_features["demand_rolling_std_30"] = rolling_std_30
+                date_features["city_avg_demand"] = city_avg
+                date_features["sku_avg_demand"] = sku_avg
+                date_features["country_avg_demand"] = country_avg
+                date_features["demand_volatility"] = volatility
+                
+                # 가격 정보 추가
+                sku_city_price = ppt[(ppt['sku'] == sku) & (ppt['city'] == city)]
+                if len(sku_city_price) > 0:
+                    date_features["unit_price"] = sku_city_price['unit_price'].mean()
+                    date_features["discount_pct"] = sku_city_price['discount_pct'].mean()
+                else:
+                    date_features["unit_price"] = ppt['unit_price'].mean()
+                    date_features["discount_pct"] = ppt['discount_pct'].mean()
+                
+                # 이벤트 확인
+                date_features["is_event_month"] = 0
+                date_features["event_multiplier"] = 1.0
+                
+                # 과거 이벤트 패턴 기반 동적 배수
+                for _, event in events_df.iterrows():
+                    if event['country'] == country:
+                        if date.month == event['date'].month:
+                            date_features["is_event_month"] = 1
+                            date_features["event_multiplier"] = event['multiplier']
+                            break
+                
+                # 범주형 인코딩
+                for col in ["city", "sku", "country", "family", "season"]:
+                    le = label_encoders[col]
+                    date_features[col + "_encoded"] = le.transform(date_features[col].astype(str))
+                
+                # 스케일링
+                X_pred = date_features[feature_cols]
+                numeric_features = [col for col in feature_cols if col not in [col + '_encoded' for col in ["city", "sku", "country", "family", "season"]]]
+                X_pred[numeric_features] = scaler.transform(X_pred[numeric_features])
+                
+                # 앙상블 예측
+                ensemble_pred = 0
+                for name, model in trained_models.items():
+                    pred = model.predict(X_pred)[0]
+                    ensemble_pred += weights[name] * pred
+                
+                # 이벤트 배수 적용
+                final_pred = int(max(ensemble_pred * date_features["event_multiplier"].iloc[0], 0))
+                
+                results.append({
+                    "date": date.strftime("%Y-%m-%d"),
+                    "sku": sku,
+                    "city": city,
+                    "mean": final_pred
+                })
+                
+                # 시계열 업데이트
+                demand_series.append(final_pred)
+                if len(demand_series) > 100:  # 메모리 효율성
+                    demand_series = demand_series[-100:]
     
-    # 기본 예측
-    print("Generating base predictions...")
-    X_pred = template[feature_cols]
-    base_predictions = final_model.predict(X_pred)
+    # 결과 저장
+    result_df = pd.DataFrame(results)
+    output_path = DATA_DIR / "enhanced_forecast_submission.csv"
+    result_df.to_csv(output_path, index=False)
     
-    # 이벤트 배수 적용
-    template["base_pred"] = base_predictions
-    template["event_multiplier"] = 1.0
+    print(f"✅ EDA 기반 고급 예측 저장: {output_path}")
+    print(f"총 예측 수: {len(result_df):,}")
+    print(f"평균 수요: {result_df['mean'].mean():.1f}")
+    print(f"최대 수요: {result_df['mean'].max():,}")
+    print(f"최소 수요: {result_df['mean'].min()}")
     
-    event_multipliers = get_event_multipliers()
-    
-    print("Applying event multipliers...")
-    for year, year_events in event_multipliers.items():
-        for country, (start_date, end_date, multiplier) in year_events.items():
-            mask = (
-                (template["country"] == country) &
-                (template["date"] >= start_date) &
-                (template["date"] <= end_date)
-            )
-            template.loc[mask, "event_multiplier"] = multiplier
-    
-    # 최종 예측값 계산
-    template["final_pred"] = template["base_pred"] * template["event_multiplier"]
-    template["mean"] = np.maximum(0, template["final_pred"].round().astype(int))
-    
-    # 결과 정리
-    result = template[["date", "sku", "city", "mean"]].copy()
-    
-    return result, template
+    return result_df
 
 def main():
     """메인 실행"""
-    print("=== Final Forecast Model ===\n")
+    print("=== EDA 기반 고급 시계열 예측 모델 ===\n")
     
-    # 예측 생성
-    forecast, detailed_template = generate_final_forecast()
+    result_df = generate_enhanced_forecast()
     
-    # 결과 저장
-    output_path = DATA_DIR / "final_forecast_submission.csv"
-    forecast.to_csv(output_path, index=False)
-    print(f"\nForecast saved to: {output_path}")
-    
-    # 결과 요약
-    print(f"\n=== Forecast Summary ===")
-    print(f"Total predictions: {len(forecast):,}")
-    print(f"Date range: {forecast['date'].min()} to {forecast['date'].max()}")
-    print(f"Average daily demand: {forecast['mean'].mean():.1f}")
-    print(f"Max daily demand: {forecast['mean'].max():,}")
-    print(f"Min daily demand: {forecast['mean'].min()}")
-    
-    # 이벤트 기간 분석
-    country_map = get_country_mapping()
-    detailed_template["country"] = detailed_template["city"].map(country_map)
-    event_multipliers = get_event_multipliers()
-    
-    print(f"\n=== Event Period Analysis ===")
-    
-    for year, year_events in event_multipliers.items():
-        print(f"\n{year} Events:")
-        for country, (start_date, end_date, multiplier) in year_events.items():
-            event_mask = (
-                (detailed_template["country"] == country) &
-                (detailed_template["date"] >= start_date) &
-                (detailed_template["date"] <= end_date)
-            )
-            event_data = detailed_template[event_mask]
-            
-            if len(event_data) > 0:
-                avg_demand = event_data["mean"].mean()
-                print(f"  {country} ({start_date} to {end_date}):")
-                print(f"    Multiplier: {multiplier:.2f}x")
-                print(f"    Avg Demand: {avg_demand:.1f}")
-    
-    # 계절별 분석
-    print(f"\n=== Seasonal Analysis ===")
-    seasonal_stats = detailed_template.groupby("season")["mean"].agg(["mean", "std", "count"]).round(2)
-    print("Demand by season:")
-    print(seasonal_stats)
-    
-    return forecast
+    print(f"\n✅ EDA 기반 고급 모델 완료!")
+    print(f"📁 결과 파일: enhanced_forecast_submission.csv")
 
 if __name__ == "__main__":
-    forecast = main() 
+    main() 
